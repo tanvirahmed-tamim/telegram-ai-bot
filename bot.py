@@ -1,5 +1,7 @@
 import os
 import logging
+import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from dotenv import load_dotenv
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -15,6 +17,7 @@ from google import genai
 load_dotenv()
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+OWNER_CHAT_ID = os.getenv("OWNER_CHAT_ID")  # your numeric Telegram ID (use /myid)
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -23,12 +26,12 @@ logging.basicConfig(
 log = logging.getLogger("bot")
 ai_client = genai.Client(api_key=GEMINI_API_KEY)
 
-# Main model first, then backups if it fails (quota, overload, etc.)
+# Main model first, then backups if it fails
 MODELS = [
-    "gemini-3.1-flash-lite",
     "gemini-3.8-flash",
     "gemini-3.5-flash",
     "gemini-2.5-flash",
+    "gemini-3.1-flash-lite",
 ]
 
 user_languages = {}
@@ -37,6 +40,7 @@ user_history = {}
 CONTACT_TEXT = (
     "Contact Tamim directly:\n\n"
     "WhatsApp / Phone: +8801783608061\n"
+    "Telegram: https://t.me/tanvirtamim58\n"
     "Email: tanvirahmedtamim22@gmail.com\n"
     "Email (alt): tanvirtamimbsmrstu@gmail.com\n"
     "Website: https://seomedicalclinic.com/\n"
@@ -68,6 +72,27 @@ SYSTEM_PROMPT = (
 )
 
 
+# ---------- Tiny web server so Render detects an open port ----------
+class Ping(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"ok")
+
+    def do_HEAD(self):
+        self.send_response(200)
+        self.end_headers()
+
+    def log_message(self, *args):
+        pass
+
+
+def run_web():
+    port = int(os.environ.get("PORT", 10000))
+    HTTPServer(("0.0.0.0", port), Ping).serve_forever()
+
+
+# ---------- Helpers ----------
 def get_lang(uid):
     return user_languages.get(uid, "English")
 
@@ -84,9 +109,21 @@ def lang_keyboard():
     )
 
 
+async def send_owner(context: ContextTypes.DEFAULT_TYPE, text: str):
+    """Send a Telegram message to the owner (you)."""
+    if not OWNER_CHAT_ID:
+        return
+    try:
+        await context.bot.send_message(OWNER_CHAT_ID, text[:4000])
+    except Exception:
+        log.exception("Could not send owner message")
+
+
+# ---------- Commands ----------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "Hi, I'm Tamim's AI assistant. Choose your language / ভাষা নির্বাচন করুন:",
+        "Hi, I'm Tamim's AI assistant. Choose your language / ভাষা নির্বাচন করুন:\n\n"
+        "Note: conversations with this bot may be reviewed by Tamim.",
         reply_markup=lang_keyboard(),
     )
 
@@ -121,6 +158,11 @@ async def lang_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def myid(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(f"Your chat ID: {update.effective_user.id}")
+
+
+# ---------- AI ----------
 def ask_gemini(history):
     last_error = None
     for model in MODELS:
@@ -144,32 +186,52 @@ async def chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     lang = get_lang(uid)
     text = update.message.text
+    u = update.effective_user
+
+    # Notify owner about the new visitor message (skip if the owner is chatting)
+    if str(uid) != str(OWNER_CHAT_ID):
+        uname = f"@{u.username}" if u.username else "no username"
+        await send_owner(
+            context,
+            f"New message from {u.full_name} ({uname}, id {uid}):\n\n{text[:500]}",
+        )
 
     history = user_history.setdefault(uid, [])
     history.append({"role": "user", "parts": [{"text": f"(Reply in {lang}) {text}"}]})
-    del history[:-10]  # keep last 10 messages
+    del history[:-10]
 
     try:
         answer = ask_gemini(history)
         history.append({"role": "model", "parts": [{"text": answer}]})
         await update.message.reply_text(answer)
-    except Exception:
+    except Exception as e:
         log.exception("All models failed")
         history.pop()
         await update.message.reply_text(
             "Sorry, I couldn't answer that right now.\n\n" + CONTACT_TEXT,
             disable_web_page_preview=True,
         )
+        await send_owner(context, f"Alert: all models failed.\nError: {str(e)[:500]}")
 
 
+async def on_error(update, context: ContextTypes.DEFAULT_TYPE):
+    log.error("Unhandled error", exc_info=context.error)
+    await send_owner(context, f"Bot error: {str(context.error)[:500]}")
+
+
+# ---------- Run ----------
 if __name__ == "__main__":
+    threading.Thread(target=run_web, daemon=True).start()
+
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("contact", contact))
     app.add_handler(CommandHandler("lang", lang_cmd))
+    app.add_handler(CommandHandler("myid", myid))
     app.add_handler(CallbackQueryHandler(button_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, chat))
+    app.add_error_handler(on_error)
 
     print("Tamim's AI Assistant is running...")
     app.run_polling()
